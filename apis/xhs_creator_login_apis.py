@@ -199,6 +199,25 @@ class XHSCreatorLoginApi:
         b1_value: str | None = None,
         dsl_pair_value: str | None = None,
     ) -> tuple[dict, dict, str]:
+        # 独立调用（未经登录引导、直接用 Cookie 新建实例）时保证 DS 程序在位：
+        # 0101 + 非 nop 的签名需要服务端 DS 程序的 _dsf；get_ds_bundle 有缓存，
+        # 重复调用零成本。
+        resolved, material = self.profile.resolve_mns_material(
+            tier=tier,
+            mns_profile=mns_profile,
+        )
+        if (
+            resolved == '0101'
+            and material.device_tag != 'nop'
+            and not self.profile.ds_program
+        ):
+            from xhs_utils.xhs_creator.dsl import get_ds_bundle
+
+            dsl, program = get_ds_bundle(
+                proxies=self.proxies,
+                http_client=self.http,
+            )
+            self.profile.activate_security(dsl, ds_program=program)
         headers, cookies, body = generate_profile_request_params(
             self.profile,
             api,
@@ -802,6 +821,35 @@ class XHSCreatorLoginApi:
     def check_session(self, cookies=None):
         detail = self.query_session(cookies)
         return detail['active'], detail['cookies']
+
+    def exchange_creator_session_from_user_cookies(self, user_cookies):
+        """Validate user-provided Creator cookies and enrich them with security state.
+
+        Merges the user cookies into the current device profile (their a1 wins),
+        probes the CAS session (type=tgt), completes the security bootstrap for
+        that identity, and requires creator user-info acceptance before
+        returning the enriched Cookie map.
+        """
+        self.profile.update_cookies(user_cookies)
+        session = self.query_session()
+        if not session['active']:
+            return False, 'creator session exchange failed', {
+                'cookies': self.profile.cookie_map,
+                'res_json': session['res_json'],
+            }
+        try:
+            self._complete_security()
+        except Exception as error:
+            return False, f'creator session security bootstrap failed: {error}', {
+                'cookies': self.profile.cookie_map,
+            }
+        success, user_info, values = self.get_user_info()
+        if not success:
+            return False, 'creator session user-info acceptance failed', {
+                'cookies': values,
+                'res_json': user_info,
+            }
+        return True, '成功', {'cookies': values, 'user_info': user_info}
 
     def query_qrcode_status(self, qr_id, cookies=None) -> dict:
         """Return the complete CAS QR state without discarding ticket metadata."""
